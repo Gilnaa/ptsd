@@ -1,20 +1,19 @@
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::env;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about, allow_missing_positional = true, long_about = None, trailing_var_arg=true)]
+#[clap(author, version, about="Parallel Thing/Stuff Doer", allow_missing_positional = true, long_about = "Parallel Thing/Stuff Doer\n\nRun commands in parallel and report failures")]
 struct PtsdArgs {
-    #[clap(short, long, value_parser)]
+    #[clap(long, value_parser, help="Directory path to place command outputs in. If left unspecified, a temporary directory will be generated")]
     log_dir: Option<PathBuf>,
 
-    #[clap(short, long)]
-    shell: Option<String>,
+    #[clap(short, long, help="Use a specific shell to execute the commands", default_value="/bin/bash")]
+    shell: String,
 
-    #[clap(multiple = true)]
+    #[clap(multiple = true, required = true)]
     commands: Vec<String>,
 }
 
@@ -28,7 +27,62 @@ async fn main() {
     )
     .unwrap()
     .tick_strings(&[
-        "🕛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚",
+                "⢀⠀",
+                "⡀⠀",
+                "⠄⠀",
+                "⢂⠀",
+                "⡂⠀",
+                "⠅⠀",
+                "⢃⠀",
+                "⡃⠀",
+                "⠍⠀",
+                "⢋⠀",
+                "⡋⠀",
+                "⠍⠁",
+                "⢋⠁",
+                "⡋⠁",
+                "⠍⠉",
+                "⠋⠉",
+                "⠋⠉",
+                "⠉⠙",
+                "⠉⠙",
+                "⠉⠩",
+                "⠈⢙",
+                "⠈⡙",
+                "⢈⠩",
+                "⡀⢙",
+                "⠄⡙",
+                "⢂⠩",
+                "⡂⢘",
+                "⠅⡘",
+                "⢃⠨",
+                "⡃⢐",
+                "⠍⡐",
+                "⢋⠠",
+                "⡋⢀",
+                "⠍⡁",
+                "⢋⠁",
+                "⡋⠁",
+                "⠍⠉",
+                "⠋⠉",
+                "⠋⠉",
+                "⠉⠙",
+                "⠉⠙",
+                "⠉⠩",
+                "⠈⢙",
+                "⠈⡙",
+                "⠈⠩",
+                "⠀⢙",
+                "⠀⡙",
+                "⠀⠩",
+                "⠀⢘",
+                "⠀⡘",
+                "⠀⠨",
+                "⠀⢐",
+                "⠀⡐",
+                "⠀⠠",
+                "⠀⢀",
+                "⠀⡀"
     ]);
 
     let done_sty = ProgressStyle::with_template(
@@ -48,13 +102,12 @@ async fn main() {
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("Writing standard outputs to {log_dir:?}");
 
-    let shell = args.shell.as_deref().unwrap_or("/bin/bash");
 
     let mut tasks = Vec::new();
     for (i, cmd) in args.commands.into_iter().enumerate() {
         let pb = m.add(ProgressBar::new_spinner());
         pb.set_style(sty.clone());
-        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.enable_steady_tick(Duration::from_millis(50));
         pb.set_message(cmd.clone());
         pb.set_prefix(format!("{i}"));
 
@@ -69,7 +122,7 @@ async fn main() {
         let stderr = std::fs::File::create(stderr_file_path).unwrap();
         let stdout = std::fs::File::create(stdout_file_path).unwrap();
 
-        let proc = tokio::process::Command::new(shell)
+        let proc = tokio::process::Command::new(&args.shell)
             .arg("-c")
             .arg(cmd)
             .stderr(stderr)
@@ -99,6 +152,6 @@ async fn main() {
     }
 
     for t in tasks.into_iter() {
-        t.await;
+        let _ = t.await;
     }
 }
