@@ -13,43 +13,45 @@ use std::time::Duration;
     long_about = "Parallel Thing/Stuff Doer\n\nRun commands in parallel and report failures"
 )]
 struct PtsdArgs {
-    #[clap(
-        long,
-        value_parser,
-        help = "Directory path to place command outputs in. If left unspecified, a temporary directory will be generated"
-    )]
+    /// Directory path to place command outputs in. If left unspecified, a temporary directory will be generated
+    #[clap(long, value_parser)]
     log_dir: Option<PathBuf>,
 
-    #[clap(
-        short,
-        long,
-        help = "Use a specific shell to execute the commands",
-        default_value = "/bin/bash"
-    )]
+    /// Use a specific shell to execute the commands
+    #[clap(short, long, default_value = "/bin/bash")]
     shell: String,
 
-    #[clap(long, help = "Read commands from file")]
-    command_file: Option<PathBuf>,
-
+    /// A set of commands to run
     #[clap(multiple = true)]
     commands: Vec<String>,
+
+    /// Read commands from a file, line by line
+    #[clap(long)]
+    command_file: Option<PathBuf>,
 }
+
+const PROGRESS_TICK_FRAMES: &[&str] = &[
+    "( ●    )",
+    "(  ●   )",
+    "(   ●  )",
+    "(    ● )",
+    "(     ●)",
+    "(    ● )",
+    "(   ●  )",
+    "(  ●   )",
+    "( ●    )",
+    "(●     )",
+];
 
 #[tokio::main]
 async fn main() {
     let mut args = PtsdArgs::parse();
 
-    let m = MultiProgress::new();
-    let sty = ProgressStyle::with_template(
-        "[{elapsed_precise}] #{prefix} {spinner:8.cyan/blue} {msg:.cyan}",
-    )
-    .unwrap()
-    .tick_strings(&[
-        "⢀⠀", "⡀⠀", "⠄⠀", "⢂⠀", "⡂⠀", "⠅⠀", "⢃⠀", "⡃⠀", "⠍⠀", "⢋⠀", "⡋⠀", "⠍⠁", "⢋⠁", "⡋⠁", "⠍⠉",
-        "⠋⠉", "⠋⠉", "⠉⠙", "⠉⠙", "⠉⠩", "⠈⢙", "⠈⡙", "⢈⠩", "⡀⢙", "⠄⡙", "⢂⠩", "⡂⢘", "⠅⡘", "⢃⠨", "⡃⢐",
-        "⠍⡐", "⢋⠠", "⡋⢀", "⠍⡁", "⢋⠁", "⡋⠁", "⠍⠉", "⠋⠉", "⠋⠉", "⠉⠙", "⠉⠙", "⠉⠩", "⠈⢙", "⠈⡙", "⠈⠩",
-        "⠀⢙", "⠀⡙", "⠀⠩", "⠀⢘", "⠀⡘", "⠀⠨", "⠀⢐", "⠀⡐", "⠀⠠", "⠀⢀", "⠀⡀",
-    ]);
+    let multi_progress_bar = MultiProgress::new();
+    let sty =
+        ProgressStyle::with_template("[{elapsed_precise}] #{prefix} {spinner:8.cyan} {msg:.cyan}")
+            .unwrap()
+            .tick_strings(PROGRESS_TICK_FRAMES);
 
     let done_sty = ProgressStyle::with_template(
         "[{elapsed_precise}] #{prefix} {spinner:8.green} {msg:.green}",
@@ -92,10 +94,12 @@ async fn main() {
     eprintln!("Writing standard outputs to {log_dir:?}");
 
     let mut tasks = Vec::new();
+    let mut failed_tasks = Vec::new();
+
     for (i, cmd) in args.commands.into_iter().enumerate() {
-        let pb = m.add(ProgressBar::new_spinner());
+        let pb = multi_progress_bar.add(ProgressBar::new_spinner());
         pb.set_style(sty.clone());
-        pb.enable_steady_tick(Duration::from_millis(50));
+        pb.enable_steady_tick(Duration::from_millis(80));
         pb.set_message(cmd.clone());
         pb.set_prefix(format!("{i}"));
 
@@ -123,7 +127,8 @@ async fn main() {
             Err(_) => {
                 pb.set_style(fail_sty);
                 pb.finish();
-                return;
+                failed_tasks.push(i);
+                continue;
             }
         };
 
@@ -135,11 +140,24 @@ async fn main() {
                 pb.set_style(fail_sty);
             }
             pb.finish();
+            res.success()
         });
         tasks.push(handle);
     }
 
-    for t in tasks.into_iter() {
-        let _ = t.await;
+    // Await the tasks and record failures
+    for (i, task) in tasks.into_iter().enumerate() {
+        if let Ok(false) | Err(_) = task.await {
+            failed_tasks.push(i);
+        }
     }
+
+    let exit_code = if failed_tasks.len() > 0 {
+        eprintln!("The following tasks failed: {:?}", failed_tasks);
+        eprintln!("You can view their output in {log_dir:?}");
+        1
+    } else {
+        0
+    };
+    std::process::exit(exit_code);
 }
