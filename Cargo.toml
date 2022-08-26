@@ -1,7 +1,11 @@
 [package]
 name = "ptsd"
+description = "Does a thing, or perhaps stuff, parllelibly"
+license = "MIT"
+repository = "https://github.com/Gilnaa/ptsd"
 version = "0.1.0"
 edition = "2021"
+categories = ["command-line-interface", "command-line-utilities"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
