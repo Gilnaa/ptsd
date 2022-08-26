@@ -1,8 +1,11 @@
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -32,6 +35,12 @@ struct PtsdArgs {
     /// Disable progress bars, only print failure report
     #[clap(long, takes_value = false)]
     disable_progress: bool,
+
+    /// Limit the number of jobs that will run in parallel.
+    /// If unspecified, a sensible value will be chosen based on available
+    /// parallelism capabilities.
+    #[clap(short, long)]
+    jobs: Option<NonZeroUsize>,
 }
 
 const PROGRESS_TICK_FRAMES: &[&str] = &[
@@ -46,6 +55,37 @@ const PROGRESS_TICK_FRAMES: &[&str] = &[
     "( ●    )",
     "(●     )",
 ];
+
+#[derive(Clone)]
+struct ProgressStylesByState {
+    progress: ProgressStyle,
+    done: ProgressStyle,
+    fail: ProgressStyle,
+}
+
+fn init_progress_styles() -> ProgressStylesByState {
+    let progress =
+        ProgressStyle::with_template("[{elapsed_precise}] #{prefix} {spinner:8.cyan} {msg:.cyan}")
+            .unwrap()
+            .tick_strings(PROGRESS_TICK_FRAMES);
+
+    let done = ProgressStyle::with_template(
+        "[{elapsed_precise}] #{prefix} {spinner:8.green} {msg:.green}",
+    )
+    .unwrap()
+    .tick_strings(&["🎉"]);
+
+    let fail =
+        ProgressStyle::with_template("[{elapsed_precise}] #{prefix} {spinner:8.red} {msg:.red}")
+            .unwrap()
+            .tick_strings(&["❌"]);
+
+    ProgressStylesByState {
+        progress,
+        done,
+        fail,
+    }
+}
 
 fn spawn_task_process(
     log_dir: &PathBuf,
@@ -74,22 +114,13 @@ fn spawn_task_process(
 async fn main() {
     let mut args = PtsdArgs::parse();
 
-    let multi_progress_bar = MultiProgress::new();
-    let sty =
-        ProgressStyle::with_template("[{elapsed_precise}] #{prefix} {spinner:8.cyan} {msg:.cyan}")
-            .unwrap()
-            .tick_strings(PROGRESS_TICK_FRAMES);
+    let multi_progress_bar = if args.disable_progress {
+        None
+    } else {
+        Some(MultiProgress::new())
+    };
 
-    let done_sty = ProgressStyle::with_template(
-        "[{elapsed_precise}] #{prefix} {spinner:8.green} {msg:.green}",
-    )
-    .unwrap()
-    .tick_strings(&["🎉"]);
-
-    let fail_sty =
-        ProgressStyle::with_template("[{elapsed_precise}] #{prefix} {spinner:8.red} {msg:.red}")
-            .unwrap()
-            .tick_strings(&["❌"]);
+    let styles = init_progress_styles();
 
     if let Some(file_path) = args.command_file {
         let extra_commands = match std::fs::read_to_string(&file_path) {
@@ -122,54 +153,60 @@ async fn main() {
 
     let mut failed_tasks = Vec::new();
 
-    // Convert the collected commands into async join_handles
-    let tasks: Vec<_> = args
-        .commands
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, cmd)| {
-            let pb = if args.disable_progress {
-                None
-            } else {
-                let pb = multi_progress_bar.add(ProgressBar::new_spinner());
-                pb.set_style(sty.clone());
-                pb.enable_steady_tick(Duration::from_millis(80));
-                pb.set_message(cmd.clone());
-                pb.set_prefix(format!("{i}"));
-                Some(pb)
+    let jobs = args
+        .jobs
+        .or_else(|| std::thread::available_parallelism().ok())
+        .map(NonZeroUsize::get)
+        .unwrap_or(12);
+    let concurrent_jobs = Arc::new(Semaphore::new(jobs));
+
+    // Convert the collected commands into async join-handles
+    let mut tasks = Vec::new();
+    for (i, cmd) in args.commands.into_iter().enumerate() {
+        // Wait for a permit to be acquired before starting.
+        let permit = concurrent_jobs.clone().acquire_owned().await.unwrap();
+
+        // Cloning the styles since they're consumed by-move by every bar.
+        let styles = styles.clone();
+
+        let pb = multi_progress_bar.as_ref().map(|multi_progress_bar| {
+            let pb = multi_progress_bar.add(ProgressBar::new_spinner());
+            pb.set_style(styles.progress);
+            pb.enable_steady_tick(Duration::from_millis(80));
+            pb.set_message(cmd.clone());
+            pb.set_prefix(i.to_string());
+            pb
+        });
+
+        let mut proc =
+            match spawn_task_process(&log_dir, &format!("{i:0width$}"), &args.shell, &cmd) {
+                Ok(proc) => proc,
+                Err(_) => {
+                    pb.map(|pb| {
+                        pb.set_style(styles.fail);
+                        pb.finish();
+                    });
+                    failed_tasks.push(i);
+                    continue;
+                }
             };
 
-            let done_sty = done_sty.clone();
-            let fail_sty = fail_sty.clone();
-
-            let mut proc =
-                match spawn_task_process(&log_dir, &format!("{i:0width$}"), &args.shell, &cmd) {
-                    Ok(proc) => proc,
-                    Err(_) => {
-                        pb.map(|pb| {
-                            pb.set_style(fail_sty);
-                            pb.finish();
-                        });
-                        failed_tasks.push(i);
-                        return None;
-                    }
-                };
-            let handle = tokio::spawn(async move {
-                let res = proc.wait().await.unwrap();
-                pb.map(|pb| {
-                    if res.success() {
-                        pb.set_style(done_sty);
-                    } else {
-                        pb.set_style(fail_sty);
-                    }
-                    pb.finish();
-                });
-                // Report the process exit code as task output
-                res.success()
+        let handle = tokio::spawn(async move {
+            let res = proc.wait().await.unwrap();
+            pb.map(|pb| {
+                if res.success() {
+                    pb.set_style(styles.done);
+                } else {
+                    pb.set_style(styles.fail);
+                }
+                pb.finish();
             });
-            Some((i, handle))
-        })
-        .collect();
+            drop(permit);
+            // Report the process exit code as task output
+            res.success()
+        });
+        tasks.push((i, handle));
+    }
 
     // Await the tasks and record failures
     for (task_index, handle) in tasks {
